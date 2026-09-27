@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+_SCHEMA_VERSION = 1
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS hooks (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,6 +58,7 @@ CREATE TABLE IF NOT EXISTS broadcast_reads (
 CREATE TABLE IF NOT EXISTS fences (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     tool_pattern TEXT   NOT NULL,
+    territory   TEXT    NOT NULL DEFAULT '',
     scope       TEXT    NOT NULL DEFAULT '{}',
     rule        TEXT    NOT NULL,
     reason      TEXT    NOT NULL DEFAULT '',
@@ -94,6 +97,29 @@ def _expired(expires_at: Optional[str], now: str) -> bool:
         return True
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to the current schema. Idempotent.
+
+    ``CREATE TABLE IF NOT EXISTS`` never adds a column to a table that already exists, so a
+    store created by an earlier version stays silently missing that column and every query
+    fails with ``no such column``. Bumping ``user_version`` is the only thing that makes
+    this run, and it is cheap.
+
+    Adding a column is a metadata-only operation in SQLite, so it is safe against the other
+    sessions holding the same file open under WAL.
+    """
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version >= _SCHEMA_VERSION:
+        return
+
+    def columns(table: str) -> set[str]:
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    if version < 1 and "territory" not in columns("fences"):
+        conn.execute("ALTER TABLE fences ADD COLUMN territory TEXT NOT NULL DEFAULT ''")
+    conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+
+
 def _conn(path: Path) -> sqlite3.Connection:
     """One connection per thread; SQLite objects are not shareable across threads."""
     key = str(path)
@@ -106,6 +132,7 @@ def _conn(path: Path) -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         conn.executescript(_SCHEMA)
+        _migrate(conn)
         conn.commit()
         cache[key] = conn
     _local.conns = cache
@@ -113,10 +140,15 @@ def _conn(path: Path) -> sqlite3.Connection:
 
 
 def open_db(path: Path) -> Path:
-    """Create the schema if absent and return the db path (idempotent)."""
+    """Create or upgrade the schema if needed and return the db path (idempotent)."""
     path = Path(path)
     _conn(path)
     return path
+
+
+def schema_version(db: Path) -> int:
+    """Current schema version of *db* — the migration's own report card."""
+    return int(_conn(db).execute("PRAGMA user_version").fetchone()[0])
 
 
 def _row(r: sqlite3.Row | None) -> Optional[dict[str, Any]]:
@@ -192,7 +224,7 @@ def list_hooks(
         (now,),
     ).fetchall()
     return [h for h in (_row(r) for r in rows)
-            if _in_scope(_decode_scope(h["scope"]), agent)]
+            if scope_contains(_decode_scope(h["scope"]), agent)]
 
 
 def get_hook(db: Path, hook_id: int) -> Optional[dict[str, Any]]:
@@ -295,24 +327,36 @@ def broadcast_history(db: Path, *, limit: int = 50) -> list[dict[str, Any]]:
 def add_fence(
     db: Path, *, tool_pattern: str, rule: str, scope: Optional[dict[str, Any]] = None,
     reason: str = "", owner: str = "", expires_at: Optional[str] = None,
+    territory: str = "",
 ) -> int:
-    """A fence binds a tool inside a scope. It must carry a ``rule`` and, if scoped,
-    a ``reason`` — an unexplained bound is exactly the opaque wall we refuse to build."""
+    """A fence binds a tool inside a territory and/or a scope.
+
+    It must carry a ``rule`` and, if it is scoped at all, a ``reason`` — an unexplained bound
+    is exactly the opaque wall we refuse to build. ``territory`` is a regex over the canonical
+    workdir; a bare ``*`` is refused, because a fence that binds the whole host is a wall
+    wearing a fence's clothes.
+    """
     if not rule.strip():
         raise ValueError("a fence needs a rule: a bound with nothing to satisfy is a wall")
-    if scope and not reason.strip():
+    if (scope or territory) and not reason.strip():
         raise ValueError("a scoped fence needs a reason: unnamed bounds are opaque")
+    from .territory import pattern_is_too_broad
+    if territory and pattern_is_too_broad(territory):
+        raise ValueError(
+            f"territory pattern {territory!r} would bind every path; "
+            "name a real tree, e.g. /repos/NEXUS/.*"
+        )
     conn = _conn(db)
     cur = conn.execute(
-        "INSERT INTO fences (tool_pattern, scope, rule, reason, owner, created_at, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (tool_pattern, json.dumps(scope or {}), rule, reason, owner, _now(), expires_at),
+        "INSERT INTO fences (tool_pattern, territory, scope, rule, reason, owner, created_at, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (tool_pattern, territory, json.dumps(scope or {}), rule, reason, owner, _now(), expires_at),
     )
     conn.commit()
     return int(cur.lastrowid)
 
 
-def _in_scope(scope: dict[str, Any], agent: str) -> bool:
+def scope_contains(scope: dict[str, Any], agent: str) -> bool:
     """A scope is a whitelist of dimensions; an unset dimension matches every agent."""
     if not scope:
         return True
@@ -328,10 +372,10 @@ def _in_scope(scope: dict[str, Any], agent: str) -> bool:
 
 
 def fences_for_tool(db: Path, *, tool_name: str) -> list[dict[str, Any]]:
-    """Live fences bound to *tool_name* regardless of which agent they scope to.
+    """Live fences bound to *tool_name* regardless of agent or territory.
 
-    Scope filtering is the caller's job (it knows the agent); this exists so a boundary
-    scoped to agent A can still be *shown* to agent B. An invisible boundary is
+    Scope filtering is the caller's job (it knows the agent and the workdir); this exists so a
+    boundary scoped to agent A can still be *shown* to agent B. An invisible boundary is
     indistinguishable from an arbitrary one.
     """
     now = _now()
@@ -340,13 +384,49 @@ def fences_for_tool(db: Path, *, tool_name: str) -> list[dict[str, Any]]:
         (now,),
     ).fetchall()
     hits = [d for d in (_row_scoped(r) for r in rows) if d and _pattern_matches(d["tool_pattern"], tool_name)]
-    return sorted(hits, key=lambda d: -len(d["scope"]))
+    return sorted(hits, key=lambda d: -(len(d["scope"]) + bool(d.get("territory"))))
 
 
-def fences_for(db: Path, *, tool_name: str, agent: str) -> list[dict[str, Any]]:
-    """Live fences bound to *tool_name* for *agent*, most specific scope first."""
-    hits = [d for d in fences_for_tool(db, tool_name=tool_name) if _in_scope(d["scope"], agent)]
-    return sorted(hits, key=lambda d: -len(d["scope"]))
+def all_live_fences(db: Path) -> list[dict[str, Any]]:
+    """Every fence that has not been relaxed or expired, across all agents and territories.
+
+    This is the *visibility* query — what a peer should be told exists. Never a binding
+    query; binding goes through :func:`fences_for`, which knows the caller's territory.
+    """
+    now = _now()
+    rows = _conn(db).execute(
+        "SELECT * FROM fences WHERE relaxed_at IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+        (now,),
+    ).fetchall()
+    return [d for d in (_row_scoped(r) for r in rows) if d]
+
+
+def fences_for(db: Path, *, tool_name: str, agent: str, territory: str = "") -> list[dict[str, Any]]:
+    """Live fences that bind *agent* in *territory*, most specific first.
+
+    A fence binds when its tool matches AND both its territory and its agent scope allow this
+    caller. An empty dimension on the fence means "any", so an unscoped fence is a global
+    bound and a territory-only fence binds every agent inside that tree — which is the case
+    that matters when several differently-named agents share one workdir.
+
+    A nested worktree is *path-wise* inside its parent checkout but is a separate checkout
+    with its own index and branch, so a parent fence is reported as advisory, not applied.
+    That keeps a boundary exactly as wide as the operator declared it.
+    """
+    from .territory import _crosses_a_checkout, matches as _territory_matches
+    hits = []
+    for d in fences_for_tool(db, tool_name=tool_name):
+        pattern = d.get("territory") or ""
+        if pattern:
+            base = pattern.removesuffix(".*").rstrip("/")
+            if not _territory_matches(pattern, territory):
+                continue
+            if _crosses_a_checkout(base, territory):
+                continue  # separate checkout: visible, not binding
+        if not scope_contains(d["scope"], agent):
+            continue
+        hits.append(d)
+    return hits
 
 
 def _pattern_matches(pattern: str, tool_name: str) -> bool:

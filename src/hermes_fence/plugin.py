@@ -22,7 +22,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import fences, locks, store, sync
+from . import territory as territory_module
 from .mux import render_notice
+from .store import scope_contains
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +96,7 @@ def _sync_peers(db: Path, ctx: Any) -> list[str]:
 
 
 def _notices(db: Path, *, reader: str, agent: str, ctx: Any) -> str:
-    """Assemble everything this turn should know: hooks, broadcast, sync delta.
+    """Assemble everything this turn should know: hooks, broadcast, sync delta, advisories.
 
     *reader* is the session (delivery is per-session); *agent* is the profile (fences,
     locks, and peer identity are per-agent). Mini hooks are per-agent standing obligations,
@@ -129,7 +131,73 @@ def _notices(db: Path, *, reader: str, agent: str, ctx: Any) -> str:
                 lines.append(f"  {e['agent']} · {e['intent']}{detail}")
             blocks.append("\n".join(lines))
 
+    advisory = _advisories(db, agent)
+    if advisory:
+        blocks.append(
+            f"[FENCES ELSEWHERE — visible, not binding on you]\n"
+            + "\n".join(f"  - {line}" for line in advisory)
+        )
+
     return "\n\n".join(blocks)
+
+
+def _advisories(db: Path, agent: str) -> list[str]:
+    """Fences that bind *other* agents, or a *sibling* worktree of a tree we stand in.
+
+    A fence an agent cannot see is indistinguishable from an arbitrary one, and the
+    interesting ones bind a peer in the same workdir — the exact collision this system exists
+    to surface early. Deliberately not "every fence in the store": that is noise, and noise is
+    how a notice stops being read.
+    """
+    try:
+        from .territory import matches as _matches, repo_root as _root
+
+        mine = _my_territories()
+        trees = list(mine) + [_root(t) for t in mine]
+        out: list[str] = []
+        for f in store.all_live_fences(db):
+            pattern = f.get("territory") or ""
+            if pattern:
+                base = pattern.removesuffix(".*").rstrip("/")
+                if not any(_matches(pattern, t) or _same_tree(base, t) for t in trees):
+                    continue
+            elif scope_contains(f["scope"], agent):
+                continue  # binds us globally: enforced, not advisory
+            label = (f"{f['rule']} (on `{f['tool_pattern']}`, set by "
+                     f"{f.get('owner') or 'unattributed'})")
+            if label not in out:
+                out.append(label)
+        return out[:DEFAULT_NOTICE_LIMIT]
+    except Exception as exc:  # pragma: no cover - an advisory must never break a turn
+        logger.warning("hermes-fence advisory scan failed: %s", exc)
+        return []
+
+
+def _same_tree(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
+
+
+def _my_territories() -> list[str]:
+    """Where this agent is standing, best effort: TERMINAL_CWD, then the process cwd."""
+    import os
+
+    from . import territory as terr
+
+    spots: list[str] = []
+    try:
+        from agent.runtime_cwd import scope_terminal_cwd
+        scoped = (scope_terminal_cwd() or "").strip()
+        if scoped:
+            spots.append(terr.canonical(scoped))
+    except Exception:
+        pass
+    try:
+        spots.append(terr.canonical(os.getcwd()))
+    except OSError:
+        pass
+    return spots
 
 
 def on_pre_llm_call(ctx: Any, *, session_id: str = "", platform: str = "", **_: Any) -> Optional[dict]:
@@ -145,20 +213,26 @@ def on_pre_llm_call(ctx: Any, *, session_id: str = "", platform: str = "", **_: 
 
 def on_pre_tool_call(ctx: Any, *, tool_name: str = "", args: Optional[dict] = None,
                      **_: Any) -> Optional[dict]:
-    """Enforce fences on this tool call, as an explanation rather than a denial."""
+    """Enforce fences on this tool call, as an explanation rather than a denial.
+
+    The territory is derived from the call itself (explicit ``workdir``/``path``, else the
+    scoped terminal cwd) because ``pre_tool_call`` carries no cwd — see
+    ``territory.from_tool_args``. A fence that guessed the process cwd would bind every
+    worktree of a repo at once, which is the opacity this exists to prevent.
+
+    **Only ``block`` is returned here, ever.** Verified in
+    ``hermes_cli/plugins.py:_get_pre_tool_call_directive_details``: a ``modify`` directive
+    shallow-merges into the tool args, and its ``context`` key is never read on that path —
+    so an advisory returned from here would be silently dropped. Advisory fences are
+    therefore surfaced in ``pre_llm_call``, where ``{"context": ...}`` is honored.
+    """
     try:
         db = db_path()
         agent = _agent_name(ctx)
-        decision = fences.evaluate(db, tool_name=tool_name, agent=agent)
+        where = territory_module.from_tool_args(tool_name, args or {})
+        decision = fences.evaluate(db, tool_name=tool_name, agent=agent, territory=where)
         if decision["action"] == "block":
             return {"action": "block", "message": decision["message"]}
-        if decision["aware_of"] and _setting(ctx, "announce_boundaries", True):
-            return {
-                "action": "modify",
-                "args": {},
-                "context": (f"Note: `{tool_name}` carries fences for other agents: "
-                            + ", ".join(decision["aware_of"])),
-            }
     except Exception as exc:
         logger.warning("hermes-fence pre_tool_call failed: %s", exc, exc_info=True)
     return None
