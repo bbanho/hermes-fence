@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-fence"
+version = "0.2.0"
+description = "Mini hooks with expiry, an addressed broadcast stack, opt-in locks, and fences (not walls) for Hermes agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# No runtime dependencies on purpose: the store is stdlib sqlite3 and the Hermes surfaces
+# (plugin ctx) are injected. A fence plugin that can drag a tree into the Hermes venv is a
+# liability, not a feature.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+# One entry point => one install reaches every profile, because the Hermes venv is shared.
+[project.entry-points."hermes_agent.plugins"]
+hermes-fence = "hermes_fence.plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
